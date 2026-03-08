@@ -43,6 +43,10 @@ function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
 }
 
+function isLocalMediaPath(value: string): boolean {
+  return path.isAbsolute(value) || /^file:\/\//i.test(value);
+}
+
 async function sendOutboundText(params: {
   cfg: Parameters<typeof sendMessageFeishu>[0]["cfg"];
   to: string;
@@ -81,7 +85,13 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         return { channel: "feishu", ...result };
       } catch (err) {
         console.error(`[feishu] local image path auto-send failed:`, err);
-        // fall through to plain text as last resort
+        const result = await sendOutboundText({
+          cfg,
+          to,
+          text: "图片发送失败，请重试",
+          accountId: accountId ?? undefined,
+        });
+        return { channel: "feishu", ...result };
       }
     }
 
@@ -118,8 +128,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       } catch (err) {
         // Log the error for debugging
         console.error(`[feishu] sendMediaFeishu failed:`, err);
-        // Fallback to URL link if upload fails
-        const fallbackText = `📎 ${mediaUrl}`;
+        const fallbackText = isLocalMediaPath(mediaUrl) ? "音频发送失败，请重试" : `📎 ${mediaUrl}`;
         const result = await sendOutboundText({
           cfg,
           to,
