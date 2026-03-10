@@ -342,6 +342,7 @@ describe("feishuOutbound.sendMedia renderMode", () => {
     await feishuOutbound.sendMedia?.({
       cfg: {} as any,
       to: "chat_1",
+      text: "",
       mediaUrl: "/tmp/openclaw-voice.mp3",
       accountId: "main",
     });
@@ -366,6 +367,7 @@ describe("feishuOutbound.sendMedia renderMode", () => {
     await feishuOutbound.sendMedia?.({
       cfg: {} as any,
       to: "chat_1",
+      text: "",
       mediaUrl: "file:///tmp/openclaw-voice.mp3",
       accountId: "main",
     });
@@ -390,6 +392,7 @@ describe("feishuOutbound.sendMedia renderMode", () => {
     await feishuOutbound.sendMedia?.({
       cfg: {} as any,
       to: "chat_1",
+      text: "",
       mediaUrl: "https://example.com/audio.mp3",
       accountId: "main",
     });
