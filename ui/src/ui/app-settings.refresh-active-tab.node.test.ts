@@ -53,6 +53,7 @@ const mocks = vi.hoisted(() => ({
   loadPresenceMock: vi.fn(async () => {}),
   loadSessionsMock: vi.fn(async () => {}),
   loadSkillsMock: vi.fn(async () => {}),
+  reconcileSkillsAgentIdMock: vi.fn(),
   loadUsageMock: vi.fn(async () => {}),
   loadWorkboardMock: vi.fn(async () => {}),
   startDebugPollingMock: vi.fn(),
@@ -136,6 +137,7 @@ vi.mock("./controllers/sessions.ts", () => ({
 }));
 vi.mock("./controllers/skills.ts", () => ({
   loadSkills: mocks.loadSkillsMock,
+  reconcileSkillsAgentId: mocks.reconcileSkillsAgentIdMock,
 }));
 vi.mock("./controllers/usage.ts", () => ({
   loadUsage: mocks.loadUsageMock,
@@ -359,12 +361,34 @@ describe("refreshActiveTab", () => {
     });
   });
 
+  it("loads agents before rendering the Skills tab agent selector", async () => {
+    const host = createHost();
+    host.tab = "skills";
+    const calls: string[] = [];
+    mocks.loadAgentsMock.mockImplementationOnce(async () => {
+      calls.push("agents");
+    });
+    mocks.reconcileSkillsAgentIdMock.mockImplementationOnce(() => {
+      calls.push("reconcile");
+    });
+    mocks.loadSkillsMock.mockImplementationOnce(async () => {
+      calls.push("skills");
+    });
+
+    await refreshActiveTab(host as never);
+
+    expect(calls).toEqual(["agents", "reconcile", "skills"]);
+    expect(mocks.loadAgentsMock).toHaveBeenCalledWith(host);
+    expect(mocks.reconcileSkillsAgentIdMock).toHaveBeenCalledWith(host, host.agentsList);
+    expect(mocks.loadSkillsMock).toHaveBeenCalledWith(host);
+  });
+
   it("starts node polling on Nodes tab entry and clears pending session reloads on tab changes", () => {
     vi.useFakeTimers();
     const host = createHost();
     host.tab = "overview";
     const pendingReload = vi.fn();
-    host.sessionsChangedReloadTimer = globalThis.setTimeout(pendingReload, 1_000);
+    host.sessionsChangedReloadTimer = globalThis.setTimeout(() => pendingReload(), 1_000);
 
     setTab(host as never, "nodes");
 
@@ -382,7 +406,7 @@ describe("refreshActiveTab", () => {
   it("does not wait for secondary overview refreshes before resolving", async () => {
     const host = createHost();
     host.tab = "overview";
-    mocks.loadUsageMock.mockReturnValueOnce(new Promise<void>(() => undefined));
+    mocks.loadUsageMock.mockReturnValueOnce(new Promise<void>(() => {}));
 
     const refresh = refreshActiveTab(host as never);
     const outcome = await raceWithNextMacrotask(refresh);
@@ -518,7 +542,7 @@ describe("refreshActiveTab", () => {
   it("does not wait for cron runs before resolving the cron tab refresh", async () => {
     const host = createHost();
     host.tab = "cron";
-    mocks.loadCronRunsMock.mockReturnValueOnce(new Promise<"ok">(() => undefined));
+    mocks.loadCronRunsMock.mockReturnValueOnce(new Promise<"ok">(() => {}));
 
     const refresh = refreshActiveTab(host as never);
     const outcome = await raceWithNextMacrotask(refresh);

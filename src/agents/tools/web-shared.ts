@@ -1,7 +1,13 @@
+/**
+ * Shared web tool cache, timeout, and response helpers.
+ *
+ * Keeps web_fetch and web_search providers aligned on bounded IO and cache semantics.
+ */
 import {
   asDateTimestampMs,
   MAX_TIMER_TIMEOUT_SECONDS,
   resolveExpiresAtMsFromDurationMs,
+  resolveTimerTimeoutMs,
 } from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
@@ -84,7 +90,7 @@ export function withTimeout(signal: AbortSignal | undefined, timeoutMs: number):
     return signal ?? new AbortController().signal;
   }
   const controller = new AbortController();
-  const timer = setTimeout(controller.abort.bind(controller), timeoutMs);
+  const timer = setTimeout(controller.abort.bind(controller), resolveTimerTimeoutMs(timeoutMs, 1));
   if (signal) {
     signal.addEventListener(
       "abort",

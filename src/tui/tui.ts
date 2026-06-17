@@ -1,3 +1,4 @@
+// Runs the interactive TUI loop and coordinates backend, input, and rendering.
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -29,13 +30,16 @@ import {
 import { getSlashCommands } from "./commands.js";
 import { ChatLog } from "./components/chat-log.js";
 import { CustomEditor } from "./components/custom-editor.js";
-import { GatewayChatClient } from "./gateway-chat.js";
 import { resolveLocalRunShutdownGraceMs } from "./local-run-shutdown.js";
 import { editorTheme, theme } from "./theme/theme.js";
 import type { TuiBackend } from "./tui-backend.js";
 import { createCommandHandlers } from "./tui-command-handlers.js";
 import { createEventHandlers } from "./tui-event-handlers.js";
-import { formatGoalFooter, formatTokens } from "./tui-formatters.js";
+import {
+  formatGoalFooter,
+  formatRemoteConnectionHostFooter,
+  formatTokens,
+} from "./tui-formatters.js";
 import {
   buildTuiLastSessionScopeKey,
   readTuiLastSessionKey,
@@ -169,6 +173,16 @@ export function resolveTuiSessionKey(params: {
     return normalizeLowercaseStringOrEmpty(trimmed);
   }
   return `agent:${params.currentAgentId}:${normalizeLowercaseStringOrEmpty(trimmed)}`;
+}
+
+export function resolveTuiFooterHostLabel(params: {
+  config: OpenClawConfig;
+  connectionUrl: string;
+}): string | null {
+  if (params.config.tui?.footer?.showRemoteHost !== true) {
+    return null;
+  }
+  return formatRemoteConnectionHostFooter(params.connectionUrl);
 }
 
 export function resolveInitialTuiAgentId(params: {
@@ -397,6 +411,17 @@ export function isTuiBusyActivityStatus(status: string): boolean {
   return TUI_BUSY_ACTIVITY_STATUSES.has(status);
 }
 
+export function resolveTuiToolsToggleActivityStatus(params: {
+  currentStatus: string;
+  toolsExpanded: boolean;
+}): string {
+  const toolsStatus = params.toolsExpanded ? "tools expanded" : "tools collapsed";
+  if (isTuiBusyActivityStatus(params.currentStatus)) {
+    return params.currentStatus;
+  }
+  return toolsStatus;
+}
+
 export function resolveTuiShutdownHardExitMs(params: { localMode?: boolean } = {}): number {
   return TUI_SHUTDOWN_HARD_EXIT_MS + (params.localMode ? resolveLocalRunShutdownGraceMs() : 0);
 }
@@ -476,9 +501,16 @@ export function resolveTuiCtrlCAction(params: {
   return resolveCtrlCAction(params);
 }
 
+function resolveEmptySessionInfoDefaults(config: OpenClawConfig): SessionInfo {
+  return {
+    verboseLevel: config.agents?.defaults?.verboseDefault,
+  };
+}
+
 export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   const isLocalMode = opts.local === true || opts.backend !== undefined;
   const config = opts.config ?? getRuntimeConfig({ skipPluginValidation: !isLocalMode });
+  const emptySessionInfoDefaults = resolveEmptySessionInfoDefaults(config);
   const initialSessionInput = (opts.session ?? "").trim();
   let sessionScope: SessionScope = (config.session?.scope ?? "per-sender") as SessionScope;
   let sessionMainKey = normalizeMainKey(config.session?.mainKey);
@@ -498,6 +530,7 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   let activeChatRunId: string | null = null;
   let pendingOptimisticUserMessage = false;
   let pendingChatRunId: string | null = null;
+  let pendingSubmitDraft: { runId: string; text: string } | null = null;
   let historyLoaded = false;
   let isConnected = false;
   let wasDisconnected = false;
@@ -510,11 +543,13 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   const deliverDefault = opts.deliver ?? false;
   const autoMessage = opts.message?.trim();
   let autoMessageSent = false;
-  let sessionInfo: SessionInfo = {};
+  let sessionInfo: SessionInfo = { ...emptySessionInfoDefaults };
   let dynamicSlashCommands: CommandEntry[] = [];
   let dynamicSlashCommandsKey: string | null = null;
   let dynamicSlashCommandsInFlightKey: string | null = null;
   let dynamicSlashCommandsRequestId = 0;
+  let dynamicSlashCommandsReady = false;
+  let dynamicSlashCommandsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let lastCtrlCAt = 0;
   let exitRequested = false;
   let exitResult: TuiResult = { exitReason: "exit" };
@@ -585,6 +620,12 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     },
     set pendingChatRunId(value) {
       pendingChatRunId = value ?? null;
+    },
+    get pendingSubmitDraft() {
+      return pendingSubmitDraft;
+    },
+    set pendingSubmitDraft(value) {
+      pendingSubmitDraft = value ?? null;
     },
     get historyLoaded() {
       return historyLoaded;
@@ -707,6 +748,7 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     const { EmbeddedTuiBackend } = await import("./embedded-backend.js");
     client = new EmbeddedTuiBackend();
   } else {
+    const { GatewayChatClient } = await import("./gateway-chat.js");
     client = await GatewayChatClient.connect({
       url: opts.url,
       token: opts.token,
@@ -762,9 +804,19 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     );
   };
 
+  const clearDynamicSlashCommandsRefreshTimer = () => {
+    if (!dynamicSlashCommandsRefreshTimer) {
+      return;
+    }
+    clearTimeout(dynamicSlashCommandsRefreshTimer);
+    dynamicSlashCommandsRefreshTimer = null;
+  };
+
   const refreshDynamicSlashCommands = () => {
+    clearDynamicSlashCommandsRefreshTimer();
     const key = resolveDynamicSlashCommandsKey();
     if (
+      !dynamicSlashCommandsReady ||
       !isConnected ||
       !client.listCommands ||
       dynamicSlashCommandsKey === key ||
@@ -800,9 +852,21 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
       });
   };
 
+  const scheduleDynamicSlashCommandsRefresh = () => {
+    if (
+      !dynamicSlashCommandsReady ||
+      dynamicSlashCommandsRefreshTimer ||
+      dynamicSlashCommandsKey === resolveDynamicSlashCommandsKey()
+    ) {
+      return;
+    }
+    dynamicSlashCommandsRefreshTimer = setTimeout(refreshDynamicSlashCommands, 0);
+    dynamicSlashCommandsRefreshTimer.unref?.();
+  };
+
   const updateAutocompleteProvider = () => {
     applyAutocompleteProvider();
-    refreshDynamicSlashCommands();
+    scheduleDynamicSlashCommandsRefresh();
   };
 
   tui.addChild(root);
@@ -1160,7 +1224,9 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     const reasoning = sessionInfo.reasoningLevel ?? "off";
     const reasoningLabel =
       reasoning === "on" ? "reasoning" : reasoning === "stream" ? "reasoning:stream" : null;
+    const hostLabel = resolveTuiFooterHostLabel({ config, connectionUrl: client.connection.url });
     const footerParts = [
+      hostLabel,
       `agent ${agentLabel}`,
       `session ${sessionLabel}`,
       modelLabel,
@@ -1209,13 +1275,16 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     setActivityStatus,
     clearLocalRunIds,
     rememberSessionKey: rememberCurrentSessionKey,
+    emptySessionInfoDefaults,
   });
   const {
     refreshAgents,
     refreshSessionInfo,
     applySessionInfoFromPatch,
+    applySessionMutationResult,
     loadHistory,
     setSession,
+    setEmptySession,
     abortActive,
   } = sessionActions;
 
@@ -1223,8 +1292,12 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     handleChatEvent,
     handleAgentEvent,
     handleBtwEvent,
+    handleSessionsChangedEvent,
     pauseStreamingWatchdog,
     reconnectStreamingWatchdog,
+    consumeCompletedRunForPendingSend,
+    isRunObserved,
+    flushPendingHistoryRefreshIfIdle,
   } = createEventHandlers({
     chatLog,
     btw,
@@ -1274,7 +1347,7 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
         clearTimeout(hardExitTimer);
         stopStatusTimeout();
       })
-      .catch((err) => {
+      .catch((err: unknown) => {
         if (!isTuiTerminalLossError(err)) {
           try {
             process.stderr.write(`openclaw tui shutdown failed: ${String(err)}\n`);
@@ -1304,8 +1377,10 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
       closeOverlay,
       refreshSessionInfo,
       applySessionInfoFromPatch,
+      applySessionMutationResult,
       loadHistory,
       setSession,
+      setEmptySession,
       refreshAgents,
       abortActive,
       setActivityStatus,
@@ -1314,6 +1389,9 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
       noteLocalBtwRunId,
       forgetLocalRunId,
       forgetLocalBtwRunId,
+      consumeCompletedRunForPendingSend,
+      isRunObserved,
+      flushPendingHistoryRefreshIfIdle,
       runAuthFlow,
       requestExit,
     });
@@ -1394,7 +1472,14 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
   editor.onCtrlO = () => {
     toolsExpanded = !toolsExpanded;
     chatLog.setToolsExpanded(toolsExpanded);
-    setActivityStatus(toolsExpanded ? "tools expanded" : "tools collapsed");
+    // Ctrl+O is presentation-only; preserve busy activity so the status loader
+    // does not disappear before the run lifecycle ends.
+    setActivityStatus(
+      resolveTuiToolsToggleActivityStatus({
+        currentStatus: activityStatus,
+        toolsExpanded,
+      }),
+    );
     tui.requestRender();
   };
   editor.onCtrlL = () => {
@@ -1436,6 +1521,9 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     if (evt.event === "agent") {
       handleAgentEvent(evt.payload);
     }
+    if (evt.event === "sessions.changed") {
+      handleSessionsChangedEvent(evt.payload);
+    }
   };
 
   client.onConnected = () => {
@@ -1448,6 +1536,11 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     }
     setConnectionStatus(isLocalMode ? "local ready" : "connected");
     void (async () => {
+      try {
+        await client.subscribeSessionEvents?.();
+      } catch (err) {
+        chatLog.addSystem(`session event subscribe failed: ${String(err)}`);
+      }
       await refreshAgents();
       await restoreRememberedSession();
       updateHeader();
@@ -1458,13 +1551,15 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
         4000,
       );
       tui.requestRender();
+      dynamicSlashCommandsReady = true;
+      scheduleDynamicSlashCommandsRefresh();
       if (!autoMessageSent && autoMessage) {
         autoMessageSent = true;
         await sendMessage(autoMessage);
       }
       updateFooter();
       tui.requestRender();
-    })().catch((err) => {
+    })().catch((err: unknown) => {
       chatLog.addSystem(`startup failed: ${String(err)}`);
       setConnectionStatus("startup failed", 5000);
       tui.requestRender();
@@ -1478,6 +1573,8 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
     dynamicSlashCommands = [];
     dynamicSlashCommandsKey = null;
     dynamicSlashCommandsInFlightKey = null;
+    dynamicSlashCommandsReady = false;
+    clearDynamicSlashCommandsRefreshTimer();
     dynamicSlashCommandsRequestId += 1;
     updateAutocompleteProvider();
     pauseStreamingWatchdog();

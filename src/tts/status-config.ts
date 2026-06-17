@@ -1,3 +1,4 @@
+// TTS status config helpers resolve status output paths for speech generation.
 import path from "node:path";
 import { isRecord as isObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import {
@@ -239,7 +240,7 @@ export function resolveStatusTtsSnapshot(params: {
   }
 
   const persona =
-    prefs.tts && Object.prototype.hasOwnProperty.call(prefs.tts, "persona")
+    prefs.tts && Object.hasOwn(prefs.tts, "persona")
       ? normalizeTtsPersonaId(prefs.tts.persona)
       : normalizeTtsPersonaId(raw.persona);
   const provider =

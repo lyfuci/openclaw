@@ -1,3 +1,4 @@
+// Gateway RPC handlers for Talk voice, transcription, and speech synthesis surfaces.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
@@ -324,7 +325,7 @@ function resolveTalkSpeed(params: TalkSpeakParams): number | undefined {
     return undefined;
   }
   const resolved = params.rateWpm / 175;
-  if (resolved <= 0.5 || resolved >= 2.0) {
+  if (resolved <= 0.5 || resolved >= 2) {
     return undefined;
   }
   return resolved;
@@ -512,6 +513,7 @@ function stripUnresolvedSecretApiKeyFromRecord(
   return rest;
 }
 
+/** Gateway request handlers for Talk config, catalog, mode, sessions, and speech. */
 export const talkHandlers: GatewayRequestHandlers = {
   ...talkSessionHandlers,
   ...talkClientHandlers,

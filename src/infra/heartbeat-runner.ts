@@ -1,3 +1,4 @@
+// Runs heartbeat checks and emits status updates for configured agents.
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -19,6 +20,7 @@ import {
 } from "../agents/agent-scope.js";
 import { appendCronStyleCurrentTimeLine } from "../agents/current-time.js";
 import { resolveEmbeddedSessionLane } from "../agents/embedded-agent-runner/lanes.js";
+import { listActiveEmbeddedRunSessionKeys } from "../agents/embedded-agent-runner/run-state.js";
 import { formatReasoningMessage } from "../agents/embedded-agent-utils.js";
 import { resolveAgentHarnessPolicy } from "../agents/harness/policy.js";
 import { resolveModelRefFromString, type ModelRef } from "../agents/model-selection.js";
@@ -42,6 +44,10 @@ import {
 } from "../auto-reply/heartbeat.js";
 import { replaceGenericExternalRunFailureText } from "../auto-reply/reply/agent-runner-failure-copy.js";
 import { resolveDefaultModel } from "../auto-reply/reply/directive-handling.defaults.js";
+import {
+  REPLY_OPERATION_RUN_STATE,
+  type ReplyOperationRunState,
+} from "../auto-reply/reply/reply-operation-run-state.js";
 import {
   listActiveReplyRunSessionKeys,
   replyRunRegistry,
@@ -154,6 +160,7 @@ export type HeartbeatDeps = OutboundSendDeps &
     getCommandLaneSnapshots?: () => readonly CommandLaneSnapshot[];
     isReplyRunActive?: (sessionKey: string) => boolean;
     listActiveReplyRunSessionKeys?: () => readonly string[];
+    listActiveEmbeddedRunSessionKeys?: () => readonly string[];
     nowMs?: () => number;
   };
 
@@ -228,15 +235,20 @@ function hasAgentOptInBusyLaneWork(
   return hasQueuedWorkInLaneSnapshots(getSnapshots(), (lane) => laneBelongsToAgent(lane, agentId));
 }
 
-function hasActiveReplyRunForAgent(
-  agentId: string,
-  listSessionKeys: () => readonly string[],
-): boolean {
+function hasActiveRunForAgent(agentId: string, listSessionKeys: () => readonly string[]): boolean {
   const normalizedAgentId = normalizeAgentId(agentId);
   return listSessionKeys().some((sessionKey) => {
     const parsed = parseAgentSessionKey(sessionKey);
     return parsed ? normalizeAgentId(parsed.agentId) === normalizedAgentId : false;
   });
+}
+
+function hasActiveRunForSession(
+  sessionKey: string,
+  listSessionKeys: () => readonly string[],
+): boolean {
+  const normalizedSessionKey = sessionKey.trim();
+  return Boolean(normalizedSessionKey) && listSessionKeys().includes(normalizedSessionKey);
 }
 
 function resolveHeartbeatChannelPlugin(channel: string): ChannelPlugin | undefined {
@@ -1357,10 +1369,16 @@ export async function runHeartbeatOnce(opts: {
   const shouldHonorActiveReplyRuns = opts.intent !== "immediate" && opts.intent !== "manual";
   const listActiveReplyRuns =
     opts.deps?.listActiveReplyRunSessionKeys ?? listActiveReplyRunSessionKeys;
+  const listActiveEmbeddedRuns =
+    opts.deps?.listActiveEmbeddedRunSessionKeys ?? listActiveEmbeddedRunSessionKeys;
   // Scheduled heartbeats are background work, so defer them when any session on
   // the same agent is already replying; immediate/manual wakes keep their
   // existing semantics for explicit user/system actions.
-  if (shouldHonorActiveReplyRuns && hasActiveReplyRunForAgent(agentId, listActiveReplyRuns)) {
+  if (
+    shouldHonorActiveReplyRuns &&
+    (hasActiveRunForAgent(agentId, listActiveReplyRuns) ||
+      hasActiveRunForAgent(agentId, listActiveEmbeddedRuns))
+  ) {
     emitHeartbeatEvent({
       status: "skipped",
       reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
@@ -1416,7 +1434,7 @@ export async function runHeartbeatOnce(opts: {
   const { entry, sessionKey, storePath, suppressOriginatingContext } = preflight.session;
   const isReplyRunActive =
     opts.deps?.isReplyRunActive ?? ((key: string) => replyRunRegistry.isActive(key));
-  if (isReplyRunActive(sessionKey)) {
+  if (isReplyRunActive(sessionKey) || hasActiveRunForSession(sessionKey, listActiveEmbeddedRuns)) {
     emitHeartbeatEvent({
       status: "skipped",
       reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
@@ -1558,6 +1576,7 @@ export async function runHeartbeatOnce(opts: {
   }
 
   let runSessionKey = sessionKey;
+  let outboundPolicySessionKey: string | undefined;
   if (useIsolatedSession) {
     const configuredSession = resolveHeartbeatSession(cfg, agentId, heartbeat);
     // Collapse only the repeated `:heartbeat` suffixes introduced by wake-triggered
@@ -1574,7 +1593,10 @@ export async function runHeartbeatOnce(opts: {
       isolatedSessionKey,
       isolatedBaseSessionKey,
     });
-    if (isReplyRunActive(isolatedSessionKey)) {
+    if (
+      isReplyRunActive(isolatedSessionKey) ||
+      hasActiveRunForSession(isolatedSessionKey, listActiveEmbeddedRuns)
+    ) {
       emitHeartbeatEvent({
         status: "skipped",
         reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
@@ -1627,6 +1649,7 @@ export async function runHeartbeatOnce(opts: {
       }
     }
     runSessionKey = isolatedSessionKey;
+    outboundPolicySessionKey = isolatedBaseSessionKey;
   }
   // Update task last run times AFTER successful heartbeat completion
   const updateTaskTimestamps = async () => {
@@ -1706,7 +1729,8 @@ export async function runHeartbeatOnce(opts: {
   const outboundSession = buildOutboundSessionContext({
     cfg,
     agentId,
-    sessionKey,
+    sessionKey: runSessionKey,
+    policySessionKey: outboundPolicySessionKey,
   });
   const canAttemptHeartbeatOk = Boolean(
     !hasDueCommitments && visibility.showOk && delivery.channel !== "none" && delivery.to,
@@ -1777,8 +1801,10 @@ export async function runHeartbeatOnce(opts: {
     const timeoutOverrideSeconds = resolveHeartbeatTimeoutOverrideSeconds(cfg, heartbeat);
     const bootstrapContextMode: "lightweight" | undefined =
       heartbeat?.lightContext === true ? "lightweight" : undefined;
+    const replyOperationRunState: ReplyOperationRunState = {};
     const replyOpts = {
       isHeartbeat: true,
+      [REPLY_OPERATION_RUN_STATE]: replyOperationRunState,
       ...(heartbeatModelOverride ? { heartbeatModelOverride } : {}),
       suppressToolErrorWarnings,
       ...(usesHeartbeatResponseTool ? { enableHeartbeatTool: true, forceHeartbeatTool: true } : {}),
@@ -1796,6 +1822,19 @@ export async function runHeartbeatOnce(opts: {
     const replyResult = await getReplyFromConfig(ctx, replyOpts, cfg);
     const heartbeatToolResponse = resolveHeartbeatToolResponseFromReplyResult(replyResult);
     const replyPayload = resolveHeartbeatReplyPayload(replyResult);
+    if (
+      !heartbeatToolResponse &&
+      (!replyPayload || !hasOutboundReplyContent(replyPayload)) &&
+      replyOperationRunState.admission?.status === "skipped" &&
+      replyOperationRunState.admission.reason === "active-run"
+    ) {
+      emitHeartbeatEvent({
+        status: "skipped",
+        reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
+        durationMs: Date.now() - startedAt,
+      });
+      return { status: "skipped", reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT };
+    }
     const includeReasoning = heartbeat?.includeReasoning === true;
     const reasoningPayloads = includeReasoning
       ? resolveHeartbeatReasoningPayloads(replyResult).filter((payload) => payload !== replyPayload)
@@ -2056,15 +2095,20 @@ export async function runHeartbeatOnce(opts: {
     if (send.status === "failed" || send.status === "partial_failed") {
       throw send.error;
     }
-    await markCommitmentsStatus({
-      cfg,
-      ids: dueCommitmentIds,
-      status: shouldSkipMain ? "dismissed" : "sent",
-      nowMs: startedAt,
-    });
+    const visibleSendSucceeded = send.status === "sent";
+    // Suppressed durable sends committed no visible channel message. Keep due
+    // commitments and heartbeat dedupe state active so a later heartbeat can retry.
+    if (shouldSkipMain || visibleSendSucceeded) {
+      await markCommitmentsStatus({
+        cfg,
+        ids: dueCommitmentIds,
+        status: shouldSkipMain ? "dismissed" : "sent",
+        nowMs: startedAt,
+      });
+    }
 
     // Record last delivered heartbeat payload for dedupe.
-    if (!shouldSkipMain && normalized.text.trim()) {
+    if (visibleSendSucceeded && !shouldSkipMain && normalized.text.trim()) {
       await updateSessionStore(storePath, (store) => {
         const current = store[sessionKey];
         if (!current) {
@@ -2078,17 +2122,22 @@ export async function runHeartbeatOnce(opts: {
       });
     }
 
-    const sentStatus = deliveredAgentRunFailure ? "failed" : "sent";
+    const eventStatus = deliveredAgentRunFailure
+      ? "failed"
+      : visibleSendSucceeded
+        ? "sent"
+        : "skipped";
     emitHeartbeatEvent({
-      status: sentStatus,
+      status: eventStatus,
       to: delivery.to,
       ...(deliveredAgentRunFailure ? { reason: "agent-runner-failure" } : {}),
+      ...(!deliveredAgentRunFailure && !visibleSendSucceeded ? { reason: send.reason } : {}),
       preview: previewText?.slice(0, 200),
       durationMs: Date.now() - startedAt,
       hasMedia: mediaUrls.length > 0,
       channel: delivery.channel,
       accountId: delivery.accountId,
-      indicatorType: visibility.useIndicator ? resolveIndicatorType(sentStatus) : undefined,
+      indicatorType: visibility.useIndicator ? resolveIndicatorType(eventStatus) : undefined,
     });
     await updateTaskTimestamps();
     consumeInspectedSystemEvents();
@@ -2169,6 +2218,20 @@ export function startHeartbeatRunner(opts: {
           // for cooldown purposes, so keep the existing now + interval behavior.
           now + agent.intervalMs;
     agent.nextDueMs = seekActiveSlotForAgent(agent, rawDueMs);
+  };
+
+  const advanceStaleScheduleAfterDeferral = (
+    agent: HeartbeatAgentState,
+    now: number,
+    reason?: string,
+    decision?: DeferDecision,
+  ) => {
+    if (!decision?.defer || decision.reason === "not-due" || agent.nextDueMs > now) {
+      return;
+    }
+    // Deferrals that do not have wake-layer retry ownership still need to move
+    // the due slot forward; otherwise scheduleNext() will keep rearming at 0ms.
+    advanceAgentSchedule(agent, now, reason);
   };
 
   // Centralized cooldown gate. Both targeted and broadcast dispatch branches
@@ -2366,6 +2429,7 @@ export function startHeartbeatRunner(opts: {
         }
         const deferral = evaluateWakeDeferral(targetAgent, now, reason, intent);
         if (deferral.defer) {
+          advanceStaleScheduleAfterDeferral(targetAgent, now, reason, deferral);
           return { status: "skipped", reason: deferral.reason };
         }
         try {
@@ -2395,11 +2459,10 @@ export function startHeartbeatRunner(opts: {
             return res;
           }
           // Non-retryable outcome (ran, disabled, failed-but-not-busy). Record
-          // bookkeeping so subsequent wakes within the cooldown window defer.
+          // bookkeeping and move the due slot so scheduleNext() cannot hot-loop
+          // on a stale past-due agent.
           recordRunBookkeeping(targetAgent, now);
-          if (res.status !== "skipped" || res.reason !== "disabled") {
-            advanceAgentSchedule(targetAgent, now, reason);
-          }
+          advanceAgentSchedule(targetAgent, now, reason);
           return res.status === "ran" ? { status: "ran", durationMs: Date.now() - startedAt } : res;
         } catch (err) {
           const errMsg = formatErrorMessage(err);
@@ -2428,6 +2491,7 @@ export function startHeartbeatRunner(opts: {
       const runOneAgent = async (agent: HeartbeatAgentState): Promise<AgentWakeOutcome> => {
         const deferral = evaluateWakeDeferral(agent, now, reason, intent);
         if (deferral.defer) {
+          advanceStaleScheduleAfterDeferral(agent, now, reason, deferral);
           return { ran: false };
         }
 
@@ -2462,9 +2526,7 @@ export function startHeartbeatRunner(opts: {
         }
         // Non-retryable outcome — record bookkeeping for cooldown gates.
         recordRunBookkeeping(agent, now);
-        if (res.status !== "skipped" || res.reason !== "disabled") {
-          advanceAgentSchedule(agent, now, reason);
-        }
+        advanceAgentSchedule(agent, now, reason);
         let agentRan = res.status === "ran";
 
         const defaultSessionKey = resolveHeartbeatSession(

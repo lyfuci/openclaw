@@ -53,14 +53,60 @@ function resolveTimeoutMs(envName, defaultValue) {
   if (raw === undefined || raw === "") {
     return defaultValue;
   }
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  if (!/^[0-9]+$/u.test(raw)) {
     throw new Error(`${envName} must be a positive timeout in milliseconds`);
   }
-  return Math.trunc(parsed);
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${envName} must be a positive timeout in milliseconds`);
+  }
+  return parsed;
 }
 
-function parseArgs(argv) {
+function readOptionValue(argv, index, optionName) {
+  const value = argv[index + 1];
+  if (value === undefined || value === "" || value.startsWith("--")) {
+    throw new Error(`${optionName} requires a value`);
+  }
+  return value;
+}
+
+function readEqualsOptionValue(value, optionName) {
+  if (value === "" || value.startsWith("--")) {
+    throw new Error(`${optionName} requires a value`);
+  }
+  return value;
+}
+
+function validateOutputName(value) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.t(?:ar\.)?gz$/u.test(value)) {
+    throw new Error(`--output-name must be a tarball filename, not a path: ${value}`);
+  }
+}
+
+function resolvePackedOpenClawFileName(value) {
+  const filename = value.trim();
+  if (
+    !filename.endsWith(".tgz") ||
+    (!filename.startsWith("openclaw-") &&
+      !filename.includes(":") &&
+      !filename.includes("/") &&
+      !filename.includes("\\"))
+  ) {
+    return "";
+  }
+  if (
+    !/^openclaw-[A-Za-z0-9._-]+\.tgz$/u.test(filename) ||
+    filename.includes("\0") ||
+    filename !== path.basename(filename) ||
+    filename !== path.win32.basename(filename)
+  ) {
+    throw new Error(`npm pack reported unsafe OpenClaw tarball filename: ${filename}`);
+  }
+  return filename;
+}
+
+export function parseArgs(argv) {
   const options = {
     outputDir: "",
     outputName: "",
@@ -70,22 +116,31 @@ function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--output-dir") {
-      options.outputDir = argv[(index += 1)] ?? "";
+      options.outputDir = readOptionValue(argv, index, arg);
+      index += 1;
     } else if (arg?.startsWith("--output-dir=")) {
-      options.outputDir = arg.slice("--output-dir=".length);
+      options.outputDir = readEqualsOptionValue(arg.slice("--output-dir=".length), "--output-dir");
     } else if (arg === "--output-name") {
-      options.outputName = argv[(index += 1)] ?? "";
+      options.outputName = readOptionValue(argv, index, arg);
+      index += 1;
     } else if (arg?.startsWith("--output-name=")) {
-      options.outputName = arg.slice("--output-name=".length);
+      options.outputName = readEqualsOptionValue(
+        arg.slice("--output-name=".length),
+        "--output-name",
+      );
     } else if (arg === "--skip-build") {
       options.skipBuild = true;
     } else if (arg === "--source-dir") {
-      options.sourceDir = argv[(index += 1)] ?? "";
+      options.sourceDir = readOptionValue(argv, index, arg);
+      index += 1;
     } else if (arg?.startsWith("--source-dir=")) {
-      options.sourceDir = arg.slice("--source-dir=".length);
+      options.sourceDir = readEqualsOptionValue(arg.slice("--source-dir=".length), "--source-dir");
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
+  }
+  if (options.outputName) {
+    validateOutputName(options.outputName);
   }
   return options;
 }
@@ -104,7 +159,6 @@ function run(command, args, cwd, options = {}) {
     let stdout = "";
     let stdoutBytes = 0;
     let settled = false;
-    let timeout;
     let forceKillTimeout;
     const maxCapturedStdoutBytes = Math.max(
       1,
@@ -127,7 +181,7 @@ function run(command, args, cwd, options = {}) {
         process.exit(forwardedSignalExitCode);
       }
       if (error) {
-        reject(error);
+        reject(toLintErrorObject(error, "Non-Error rejection"));
         return;
       }
       resolve(value);
@@ -143,16 +197,30 @@ function run(command, args, cwd, options = {}) {
       }
       child.kill(signal);
     };
+    const processGroupAlive = () => {
+      if (!useProcessGroup || !child.pid) {
+        return false;
+      }
+      try {
+        process.kill(-child.pid, 0);
+        return true;
+      } catch (error) {
+        return error?.code === "EPERM";
+      }
+    };
     const terminateChild = () => {
       killChild("SIGTERM");
-      forceKillTimeout = setTimeout(
-        () => killChild("SIGKILL"),
-        options.killAfterMs ?? DEFAULT_TIMEOUT_KILL_AFTER_MS,
-      );
+      forceKillTimeout = setTimeout(() => {
+        forceKillTimeout = undefined;
+        if (settled && !processGroupAlive()) {
+          return;
+        }
+        killChild("SIGKILL");
+      }, options.killAfterMs ?? DEFAULT_TIMEOUT_KILL_AFTER_MS);
       forceKillTimeout.unref?.();
     };
     ACTIVE_CHILD_KILLERS.add(killChild);
-    timeout =
+    const timeout =
       options.timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
@@ -237,9 +305,9 @@ async function runCapture(command, args, cwd, options = {}) {
 async function newestOpenClawTarball(outputDir, packOutput) {
   let fromOutput = "";
   for (const line of packOutput.split(/\r?\n/u)) {
-    const trimmed = line.trim();
-    if (/^openclaw-.*\.tgz$/u.test(trimmed)) {
-      fromOutput = trimmed;
+    const filename = resolvePackedOpenClawFileName(line);
+    if (filename) {
+      fromOutput = filename;
     }
   }
   if (fromOutput) {
@@ -248,7 +316,13 @@ async function newestOpenClawTarball(outputDir, packOutput) {
 
   const entries = await fs.readdir(outputDir);
   const packed = entries
-    .filter((entry) => /^openclaw-.*\.tgz$/u.test(entry))
+    .filter((entry) => {
+      try {
+        return resolvePackedOpenClawFileName(entry) === entry;
+      } catch {
+        return false;
+      }
+    })
     .toSorted()
     .at(-1);
   if (!packed) {
@@ -263,7 +337,7 @@ export async function packOpenClawPackageForDocker(sourceDir, outputDir, options
   const restoreChangelog = options.restoreChangelog ?? restorePackageChangelog;
   console.error("==> Packing OpenClaw package");
   await prepareChangelog(sourceDir);
-  let packOutput = "";
+  let packOutput;
   try {
     packOutput = await runCaptureImpl(
       "npm",
@@ -347,8 +421,24 @@ async function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exit(Number.isInteger(error?.exitCode) ? error.exitCode : 1);
-  });
+  await main().catch(
+    /** @param {unknown} error */ (error) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(Number.isInteger(error?.exitCode) ? error.exitCode : 1);
+    },
+  );
+}
+
+function toLintErrorObject(value, fallbackMessage) {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
 }

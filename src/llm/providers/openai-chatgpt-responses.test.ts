@@ -1,3 +1,4 @@
+// ChatGPT Responses provider tests cover stream handling and timeout behavior.
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Context, Model } from "../types.js";
@@ -148,6 +149,170 @@ describe("streamOpenAICodexResponses transport", () => {
 
     expect(result.stopReason).toBe("error");
     expect(result.errorMessage).toContain("Request timed out after 5ms");
+  });
+
+  it("does not replay Responses item ids for store-disabled ChatGPT requests", async () => {
+    let capturedPayload:
+      | {
+          store?: unknown;
+          input?: Array<Record<string, unknown>>;
+        }
+      | undefined;
+    const stream = streamOpenAICodexResponses(
+      model,
+      {
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-chatgpt-responses",
+            provider: model.provider,
+            model: model.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "toolUse",
+            timestamp: 1,
+            content: [
+              {
+                type: "thinking",
+                thinking: "Need a tool.",
+                thinkingSignature: JSON.stringify({
+                  type: "reasoning",
+                  id: "rs_prior",
+                  encrypted_content: "ciphertext",
+                }),
+              },
+              {
+                type: "text",
+                text: "Checking.",
+                textSignature: JSON.stringify({
+                  v: 1,
+                  id: "msg_prior",
+                  phase: "commentary",
+                }),
+              },
+              {
+                type: "toolCall",
+                id: "call_abc|fc_prior",
+                name: "lookup",
+                arguments: {},
+              },
+            ],
+          },
+        ],
+      },
+      {
+        apiKey: createJwt({
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acct-1",
+          },
+        }),
+        transport: "sse",
+        onPayload: (payload) => {
+          capturedPayload = payload as typeof capturedPayload;
+          throw new Error("stop after payload");
+        },
+      },
+    );
+
+    const result = await stream.result();
+
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toBe("stop after payload");
+    expect(capturedPayload?.store).toBe(false);
+    const reasoningItem = capturedPayload?.input?.find((item) => item.type === "reasoning");
+    expect(reasoningItem).toMatchObject({
+      type: "reasoning",
+      encrypted_content: "ciphertext",
+      summary: [],
+    });
+    expect(reasoningItem).not.toHaveProperty("id");
+    const messageItem = capturedPayload?.input?.find((item) => item.type === "message");
+    expect(messageItem).toMatchObject({
+      type: "message",
+      phase: "commentary",
+    });
+    expect(messageItem).not.toHaveProperty("id");
+    const functionCall = capturedPayload?.input?.find((item) => item.type === "function_call");
+    expect(functionCall).toMatchObject({
+      type: "function_call",
+      call_id: "call_abc",
+    });
+    expect(functionCall).not.toHaveProperty("id");
+  });
+
+  it("omits ChatGPT tool controls when every tool schema is unreadable", async () => {
+    let capturedPayload: Record<string, unknown> | undefined;
+    const stream = streamOpenAICodexResponses(
+      model,
+      {
+        ...context,
+        tools: [
+          {
+            name: "broken",
+            description: "Broken tool.",
+            get parameters(): never {
+              throw new Error("parameters exploded");
+            },
+          },
+        ],
+      },
+      {
+        apiKey: createJwt({
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acct-1",
+          },
+        }),
+        transport: "sse",
+        onPayload: (payload) => {
+          capturedPayload = payload as Record<string, unknown>;
+          throw new Error("stop after payload");
+        },
+      },
+    );
+
+    const result = await stream.result();
+
+    expect(result.stopReason).toBe("error");
+    expect(capturedPayload).not.toHaveProperty("tools");
+    expect(capturedPayload).not.toHaveProperty("tool_choice");
+    expect(capturedPayload).not.toHaveProperty("parallel_tool_calls");
+  });
+
+  it("does not reread an unreadable ChatGPT tool inventory length", async () => {
+    let capturedPayload: Record<string, unknown> | undefined;
+    const tools = new Proxy([], {
+      get(target, property, receiver) {
+        if (property === "length") {
+          throw new Error("length exploded");
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const stream = streamOpenAICodexResponses(model, { ...context, tools } as never, {
+      apiKey: createJwt({
+        "https://api.openai.com/auth": {
+          chatgpt_account_id: "acct-1",
+        },
+      }),
+      transport: "sse",
+      onPayload: (payload) => {
+        capturedPayload = payload as Record<string, unknown>;
+        throw new Error("stop after payload");
+      },
+    });
+
+    const result = await stream.result();
+
+    expect(result.stopReason).toBe("error");
+    expect(capturedPayload).not.toHaveProperty("tools");
+    expect(capturedPayload).not.toHaveProperty("tool_choice");
+    expect(capturedPayload).not.toHaveProperty("parallel_tool_calls");
   });
 
   it("caps oversized timeoutMs before creating request abort signals", async () => {

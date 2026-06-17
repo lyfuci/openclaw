@@ -1,3 +1,4 @@
+/** Classifies systemd/systemctl unavailable errors into user-facing categories. */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
 export type SystemdUnavailableKind =
@@ -5,6 +6,7 @@ export type SystemdUnavailableKind =
   | "user_bus_unavailable"
   | "generic_unavailable";
 
+// Normalizes platform command output before matching known systemd failure families.
 function normalizeDetail(detail?: string): string {
   return normalizeLowercaseStringOrEmpty(detail);
 }
@@ -37,9 +39,11 @@ export function classifySystemdUnavailableDetail(detail?: string): SystemdUnavai
   if (!normalized) {
     return null;
   }
-  // WSL2 reports a missing user D-Bus socket as "No such file or directory",
-  // which overlaps the broad missing-systemctl matcher. Prefer the bus-specific
-  // classifier so users get the repair hint for the actual broken subsystem.
+  // Order matters: WSL2 reports a missing user D-Bus socket as "No such file or
+  // directory", which overlaps the broad missing-systemctl matcher. Check the
+  // bus-specific classifier first so users get the repair hint for the actual
+  // broken subsystem (a live systemd install whose user bus is unavailable),
+  // distinct from systemctl genuinely being absent.
   if (isSystemdUserBusUnavailableDetail(normalized)) {
     return "user_bus_unavailable";
   }

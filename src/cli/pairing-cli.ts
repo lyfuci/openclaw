@@ -1,3 +1,4 @@
+// Pairing CLI for listing and approving channel DM pairing requests.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeStringifiedOptionalString,
@@ -51,15 +52,16 @@ function parseChannel(raw: unknown, channels: PairingChannel[]): PairingChannel 
   );
 }
 
-async function notifyApproved(channel: PairingChannel, id: string) {
+async function notifyApproved(channel: PairingChannel, id: string, accountId?: string) {
   const cfg = getRuntimeConfig();
-  await notifyPairingApproved({ channelId: channel, id, cfg });
+  await notifyPairingApproved({ channelId: channel, id, cfg, ...(accountId ? { accountId } : {}) });
 }
 
 async function maybeBootstrapCommandOwnerFromPairing(params: {
   channel: PairingChannel;
   id: string;
 }): Promise<{ ownerEntry: string | null; bootstrapped: boolean }> {
+  // First approved pairing can seed ownerAllowFrom so command access is not left open-ended.
   const ownerEntry = formatCommandOwnerFromChannelSender(params);
   if (!ownerEntry) {
     return { ownerEntry: null, bootstrapped: false };
@@ -212,7 +214,9 @@ export function registerPairingCli(program: Command) {
       if (!opts.notify) {
         return;
       }
-      await notifyApproved(channel, approved.id).catch((err) => {
+      const approvedAccountId =
+        accountId || normalizeStringifiedOptionalString(approved.entry?.meta?.accountId);
+      await notifyApproved(channel, approved.id, approvedAccountId).catch((err: unknown) => {
         defaultRuntime.log(theme.warn(`Failed to notify requester: ${String(err)}`));
       });
     });

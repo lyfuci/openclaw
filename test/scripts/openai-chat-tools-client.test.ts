@@ -1,9 +1,11 @@
+// Openai Chat Tools Client tests cover openai chat tools client script behavior.
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { createBoundedChildOutput } from "../helpers/bounded-child-output.js";
 
 const clientPath = path.resolve("scripts/e2e/lib/openai-chat-tools/client.mjs");
 const dockerRunnerPath = path.resolve("scripts/e2e/openai-chat-tools-docker.sh");
@@ -49,16 +51,16 @@ function runClient(
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
+    const stdout = createBoundedChildOutput();
+    const stderr = createBoundedChildOutput();
     let timedOut = false;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      stdout += chunk;
+      stdout.append(chunk);
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk;
+      stderr.append(chunk);
     });
     const timer = setTimeout(() => {
       timedOut = true;
@@ -66,7 +68,7 @@ function runClient(
     }, timeout);
     child.on("error", (error) => {
       clearTimeout(timer);
-      resolve({ error, signal: null, status: null, stderr, stdout });
+      resolve({ error, signal: null, status: null, stderr: stderr.text(), stdout: stdout.text() });
     });
     child.on("exit", (status, signal) => {
       clearTimeout(timer);
@@ -74,8 +76,8 @@ function runClient(
         error: timedOut ? new Error(`client timed out after ${timeout}ms`) : undefined,
         signal,
         status,
-        stderr,
-        stdout,
+        stderr: stderr.text(),
+        stdout: stdout.text(),
       });
     });
   });
@@ -111,12 +113,13 @@ function runDockerRunnerAuthPreflight(root: string, env: Record<string, string> 
   });
 }
 
-function toolCallResponse() {
+function toolCallResponse(messageOverrides: Record<string, unknown> = {}) {
   return {
     choices: [
       {
         finish_reason: "tool_calls",
         message: {
+          ...messageOverrides,
           tool_calls: [
             {
               type: "function",
@@ -133,6 +136,28 @@ function toolCallResponse() {
 }
 
 describe("scripts/e2e/lib/openai-chat-tools/client.mjs", () => {
+  let bodyReadTimeoutProbe: {
+    elapsedMs: number;
+    result: ClientResult;
+  };
+
+  beforeAll(async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write('{"choices":');
+    });
+    const port = await listen(server);
+    const startedAt = Date.now();
+    try {
+      bodyReadTimeoutProbe = {
+        result: await runClient(port, {}, 4_000),
+        elapsedMs: Date.now() - startedAt,
+      };
+    } finally {
+      server.close();
+    }
+  });
+
   it("keeps full profile exports out of the Docker build phase", () => {
     const runner = readFileSync(dockerRunnerPath, "utf8");
     const preflightSourceIndex = runner.indexOf('source "$profile_file"');
@@ -179,7 +204,6 @@ describe("scripts/e2e/lib/openai-chat-tools/client.mjs", () => {
       rmSync(root, { force: true, recursive: true });
     }
   });
-
   it("rejects loose timeout env values instead of parsing numeric prefixes", async () => {
     const result = await runClient(1, {
       OPENCLAW_OPENAI_CHAT_TOOLS_TIMEOUT_SECONDS: "1e3",
@@ -255,24 +279,27 @@ describe("scripts/e2e/lib/openai-chat-tools/client.mjs", () => {
     }
   });
 
-  it("keeps the request timeout active while reading the response body", async () => {
+  it("rejects chat completions responses that include content beside the tool call", async () => {
     const server = createServer((_request, response) => {
       response.writeHead(200, { "content-type": "application/json" });
-      response.write('{"choices":');
+      response.end(JSON.stringify(toolCallResponse({ content: "I will call the tool now." })));
     });
     const port = await listen(server);
-    const startedAt = Date.now();
     try {
-      const result = await runClient(port, {}, 4_000);
-      const elapsedMs = Date.now() - startedAt;
+      const result = await runClient(port);
 
-      expect(result.error).toBeUndefined();
       expect(result.status).not.toBe(0);
-      expect(result.stderr).toMatch(/aborted|AbortError/iu);
-      expect(elapsedMs).toBeLessThan(3_500);
+      expect(result.stderr).toContain("expected tool call only response");
     } finally {
       server.close();
     }
+  });
+
+  it("keeps the request timeout active while reading the response body", async () => {
+    expect(bodyReadTimeoutProbe.result.error).toBeUndefined();
+    expect(bodyReadTimeoutProbe.result.status).not.toBe(0);
+    expect(bodyReadTimeoutProbe.result.stderr).toMatch(/aborted|AbortError/iu);
+    expect(bodyReadTimeoutProbe.elapsedMs).toBeLessThan(3_500);
   });
 
   it("caps chat completion response bodies before JSON parsing", async () => {

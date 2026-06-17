@@ -1,16 +1,24 @@
+// Verifies plugin manifest registry construction and lookups.
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { collectChannelSchemaMetadata } from "../config/channel-config-metadata.js";
 import { collectBundledChannelConfigs } from "./bundled-channel-config-metadata.js";
 import type { PluginCandidate } from "./discovery.js";
-import { loadPluginManifestRegistry } from "./manifest-registry.js";
+import {
+  __testing as manifestRegistryTesting,
+  loadPluginManifestRegistry,
+} from "./manifest-registry.js";
 import type { OpenClawPackageManifest } from "./manifest.js";
 import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fixtures.js";
 
 vi.unmock("../version.js");
 
 const tempDirs: string[] = [];
+let manifestChangeCase: {
+  firstName: string | undefined;
+  secondName: string | undefined;
+};
 
 function chmodSafeDir(dir: string) {
   if (process.platform === "win32") {
@@ -405,7 +413,7 @@ afterEach(() => {
 });
 
 describe("loadPluginManifestRegistry", () => {
-  it("reflects plugin manifest changes on the next registry load", () => {
+  beforeAll(() => {
     const stateDir = makeTempDir();
     const pluginDir = path.join(stateDir, "extensions", "cached-manifest");
     mkdirSafe(pluginDir);
@@ -429,7 +437,6 @@ describe("loadPluginManifestRegistry", () => {
     });
 
     const first = loadPluginManifestRegistry({ env });
-    expect(first.plugins.find((plugin) => plugin.id === "cached-manifest")?.name).toBe("Before");
 
     writeManifest(pluginDir, {
       id: "cached-manifest",
@@ -440,7 +447,15 @@ describe("loadPluginManifestRegistry", () => {
     fs.utimesSync(manifestPath, updatedAt, updatedAt);
 
     const second = loadPluginManifestRegistry({ env });
-    expect(second.plugins.find((plugin) => plugin.id === "cached-manifest")?.name).toBe("After");
+    manifestChangeCase = {
+      firstName: first.plugins.find((plugin) => plugin.id === "cached-manifest")?.name,
+      secondName: second.plugins.find((plugin) => plugin.id === "cached-manifest")?.name,
+    };
+  });
+
+  it("reflects plugin manifest changes on the next registry load", () => {
+    expect(manifestChangeCase.firstName).toBe("Before");
+    expect(manifestChangeCase.secondName).toBe("After");
   });
 
   it("keeps only the higher-precedence plugin for truly distinct duplicates", () => {
@@ -682,6 +697,38 @@ describe("loadPluginManifestRegistry", () => {
     });
 
     expect(registry.plugins[0]?.trustedOfficialInstall).toBe(true);
+  });
+
+  it("marks official diagnostics-otel config paths trusted when the install record matches", () => {
+    const dir = makeTempDir();
+    writeManifest(dir, { id: "diagnostics-otel", configSchema: { type: "object" } });
+
+    const registry = loadPluginManifestRegistry({
+      installRecords: {
+        "diagnostics-otel": {
+          source: "npm",
+          spec: "@openclaw/diagnostics-otel",
+          installPath: dir,
+          resolvedName: "@openclaw/diagnostics-otel",
+          resolvedVersion: "2026.5.18",
+          resolvedSpec: "@openclaw/diagnostics-otel@2026.5.18",
+        },
+      },
+      candidates: [
+        createPluginCandidate({
+          idHint: "diagnostics-otel",
+          rootDir: dir,
+          packageName: "@openclaw/diagnostics-otel",
+          origin: "config",
+        }),
+      ],
+    });
+
+    expect(registry.plugins).toHaveLength(1);
+    expectRecordFields(registry.plugins[0], "plugin", {
+      origin: "config",
+      trustedOfficialInstall: true,
+    });
   });
 
   it("preserves trusted official installs when a config path selects the installed package", () => {
@@ -1446,9 +1493,9 @@ describe("loadPluginManifestRegistry", () => {
       throw new Error("expected external chat manifest channel config map");
     }
     expect(Object.getPrototypeOf(channelConfigs)).toBe(null);
-    expect(Object.prototype.hasOwnProperty.call(channelConfigs, "__proto__")).toBe(false);
-    expect(Object.prototype.hasOwnProperty.call(channelConfigs, "constructor")).toBe(false);
-    expect(Object.prototype.hasOwnProperty.call(channelConfigs, "prototype")).toBe(false);
+    expect(Object.hasOwn(channelConfigs, "__proto__")).toBe(false);
+    expect(Object.hasOwn(channelConfigs, "constructor")).toBe(false);
+    expect(Object.hasOwn(channelConfigs, "prototype")).toBe(false);
     expectRecordFields(channelConfigs["safe-chat"]?.schema, "safe-chat schema", {
       type: "object",
       additionalProperties: false,
@@ -1798,7 +1845,7 @@ describe("loadPluginManifestRegistry", () => {
       contracts: {
         mediaUnderstandingProviders: ["openai"],
         imageGenerationProviders: ["openai"],
-        tools: ["image_generate"],
+        tools: ["image_generate", "memory_get"],
       },
       imageGenerationProviderMetadata: {
         openai: {
@@ -1867,9 +1914,13 @@ describe("loadPluginManifestRegistry", () => {
             {
               rootPath: "plugins.entries.openai.config",
               overlayPath: "image",
+              overlayMapPath: "accounts",
               required: ["apiKey"],
             },
           ],
+        },
+        memory_get: {
+          replaySafe: true,
         },
       },
       configSchema: { type: "object" },
@@ -1942,9 +1993,13 @@ describe("loadPluginManifestRegistry", () => {
           {
             rootPath: "plugins.entries.openai.config",
             overlayPath: "image",
+            overlayMapPath: "accounts",
             required: ["apiKey"],
           },
         ],
+      },
+      memory_get: {
+        replaySafe: true,
       },
     });
   });
@@ -1968,6 +2023,46 @@ describe("loadPluginManifestRegistry", () => {
 
     expect(registry.plugins[0]?.contracts).toEqual({
       externalAuthProviders: ["acme-ai"],
+    });
+  });
+
+  it("preserves host-trusted plugin contracts from plugin manifests", () => {
+    const dir = makeTempDir();
+    writeManifest(dir, {
+      id: "workflow-harness",
+      contracts: {
+        agentToolResultMiddleware: ["openclaw", "codex"],
+        trustedToolPolicies: ["workflow-budget"],
+      },
+      configSchema: { type: "object" },
+    });
+
+    const registry = loadSingleCandidateRegistry({
+      idHint: "workflow-harness",
+      rootDir: dir,
+      origin: "workspace",
+    });
+
+    expect(registry.plugins[0]?.contracts).toEqual({
+      agentToolResultMiddleware: ["openclaw", "codex"],
+      trustedToolPolicies: ["workflow-budget"],
+    });
+  });
+
+  it("preserves host-trusted plugin contracts from catalog overlays", () => {
+    const contracts = manifestRegistryTesting.mergeManifestContracts(
+      {
+        agentToolResultMiddleware: ["openclaw"],
+      },
+      {
+        agentToolResultMiddleware: ["codex"],
+        trustedToolPolicies: ["workflow-budget"],
+      },
+    );
+
+    expect(contracts).toEqual({
+      agentToolResultMiddleware: ["openclaw", "codex"],
+      trustedToolPolicies: ["workflow-budget"],
     });
   });
 

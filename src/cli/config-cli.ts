@@ -1,3 +1,4 @@
+// Config CLI command implementation for get/set/unset/patch/validate and secret refs.
 import fs from "node:fs";
 import { isRecord as isPlainRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
@@ -143,6 +144,7 @@ function normalizeAgentDefaultModelValueForConfigMutation(value: unknown): unkno
 }
 
 function normalizeAgentListModelRefsForConfigMutation(value: unknown): unknown {
+  // Config mutation normalizes model refs at write time so later readers see canonical ids.
   if (!Array.isArray(value)) {
     return value;
   }
@@ -154,7 +156,7 @@ function normalizeAgentListModelRefsForConfigMutation(value: unknown): unknown {
     }
 
     let nextAgent = agent;
-    if (Object.prototype.hasOwnProperty.call(agent, "model")) {
+    if (Object.hasOwn(agent, "model")) {
       const model = normalizeAgentDefaultModelValueForConfigMutation(agent.model);
       if (model !== agent.model) {
         nextAgent = { ...nextAgent, model };
@@ -455,7 +457,7 @@ function parseValue(raw: string, opts: ConfigSetParseOpts): unknown {
 }
 
 function hasOwnPathKey(value: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
+  return Object.hasOwn(value, key);
 }
 
 function formatDoctorHint(message: string): string {
@@ -1763,7 +1765,7 @@ function valueHasAutoManagedChild(value: unknown, childPath: ReadonlyArray<PathS
       return false;
     }
     const record = cursor as Record<string, unknown>;
-    if (!Object.prototype.hasOwnProperty.call(record, segment)) {
+    if (!Object.hasOwn(record, segment)) {
       return false;
     }
     cursor = record[segment];

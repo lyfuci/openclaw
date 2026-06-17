@@ -1,3 +1,4 @@
+// Defines agent-related Zod schema fragments for config parsing.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { z } from "zod";
 import { AgentDefaultsSchema } from "./zod-schema.agent-defaults.js";
@@ -83,7 +84,6 @@ const AcpBindingSchema = z
         path: ["match", "peer"],
         message: "ACP bindings require match.peer.id to target a concrete conversation.",
       });
-      return;
     }
   });
 

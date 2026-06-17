@@ -1,3 +1,5 @@
+// Shared provider helper tests cover deadlines, guarded fetch policy, HTTP
+// config, multipart transcription, and error response parsing.
 import {
   MAX_DATE_TIMESTAMP_MS,
   MAX_TIMER_TIMEOUT_MS,
@@ -54,6 +56,8 @@ afterEach(() => {
 });
 
 function getFirstGuardedFetchCall() {
+  // Guarded fetch options carry SSRF and proxy policy, so assertions inspect the
+  // structured request passed to the network guard.
   const [mockCall] = fetchWithSsrFGuardMock.mock.calls;
   if (!mockCall) {
     throw new Error("Expected fetchWithSsrFGuard to be called");
@@ -160,6 +164,20 @@ describe("provider operation deadlines", () => {
     expect(settled).toBe(false);
 
     await vi.advanceTimersByTimeAsync(1);
+    await expect(wait).resolves.toBeUndefined();
+  });
+
+  it("caps oversized provider poll waits without an operation deadline", async () => {
+    vi.useFakeTimers();
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    const wait = waitProviderOperationPollInterval({
+      deadline: createProviderOperationDeadline({ label: "video generation" }),
+      pollIntervalMs: MAX_TIMER_TIMEOUT_MS + 1_000_000,
+    });
+
+    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
+    await vi.advanceTimersByTimeAsync(MAX_TIMER_TIMEOUT_MS);
     await expect(wait).resolves.toBeUndefined();
   });
 
